@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-# name: digest-never-postback
+# name: unsub-update
 # about: When a user sets Activity Summary (digest) to "Never" and they registered >10 minutes ago, send an async POST to an external endpoint.
 # version: 1.0.0
 # authors: you
