@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 # name: unsub-update
-# about: When a user sets Activity Summary (digest) to "Never" and they registered >10 minutes ago, send an async POST to an external endpoint.
-# version: 1.0.1
+# about: When a user sets Activity Summary (digest) to "Never" (email_digests=false OR digest_after_minutes<=0) and they registered >10 minutes ago, send an async POST.
+# version: 1.0.2
 # authors: you
 
 after_initialize do
@@ -10,9 +10,6 @@ after_initialize do
   require "uri"
   require "json"
 
-  # ============================================================
-  # CONFIG (EDIT HERE)
-  # ============================================================
   module ::UnsubUpdateConfig
     ENABLED = true
     ENDPOINT_URL = "https://ai.templetrends.com/unsub_update.php"
@@ -22,10 +19,11 @@ after_initialize do
     READ_TIMEOUT_SECONDS = 10
   end
 
-  # ============================================================
-  # JOB: async POST (Sidekiq)
-  # IMPORTANT: do NOT call Jobs.register_job
-  # ============================================================
+  def self._unsub_never?(user_option)
+    return false if user_option.nil?
+    user_option.email_digests == false || user_option.digest_after_minutes.to_i <= 0
+  end
+
   class ::Jobs::UnsubUpdatePostback < ::Jobs::Base
     def execute(args)
       return unless ::UnsubUpdateConfig::ENABLED
@@ -34,12 +32,8 @@ after_initialize do
       return if user.nil? || user.staged? || user.suspended?
 
       opt = user.user_option
-      return if opt.nil?
+      return unless ::UnsubUpdate._unsub_never?(opt) rescue (opt && (opt.email_digests == false || opt.digest_after_minutes.to_i <= 0))
 
-      # Only if digest is STILL "never"
-      return unless opt.digest_after_minutes.to_i <= 0
-
-      # If user registered < MIN minutes ago => DO NOTHING
       min_age = ::UnsubUpdateConfig::MIN_MINUTES_SINCE_REGISTRATION.to_i.minutes
       return if user.created_at.present? && (Time.zone.now - user.created_at) < min_age
 
@@ -49,7 +43,8 @@ after_initialize do
         "username" => user.username.to_s,
         "email" => user.email.to_s,
         "registered_at" => (user.created_at&.utc&.iso8601 || ""),
-        "digest_after_minutes" => opt.digest_after_minutes.to_i.to_s,
+        "email_digests" => (opt&.email_digests.nil? ? "" : opt.email_digests ? "1" : "0"),
+        "digest_after_minutes" => opt&.digest_after_minutes.to_i.to_s,
         "sent_at_utc" => Time.zone.now.utc.iso8601,
         "secret" => ::UnsubUpdateConfig::SHARED_SECRET
       }
@@ -67,42 +62,44 @@ after_initialize do
       begin
         resp = http.request(req)
         code = resp.code.to_i
-        if code < 200 || code >= 300
-          Rails.logger.warn("[unsub-update] POST failed user_id=#{user.id} code=#{code} body=#{resp.body.to_s[0, 500]}")
+        if code >= 200 && code < 300
+          Rails.logger.warn("[unsub-update] POST OK user_id=#{user.id} code=#{code}")
+        else
+          Rails.logger.warn("[unsub-update] POST FAILED user_id=#{user.id} code=#{code} body=#{resp.body.to_s[0, 500]}")
         end
       rescue => e
-        Rails.logger.warn("[unsub-update] POST error user_id=#{user.id} err=#{e.class}: #{e.message}")
+        Rails.logger.warn("[unsub-update] POST ERROR user_id=#{user.id} err=#{e.class}: #{e.message}")
       end
     end
   end
 
-  # ============================================================
-  # HOOK: detect digest change to "never"
-  # ============================================================
   UserOption.class_eval do
     after_commit :_unsub_update_after_commit, on: [:update]
 
     def _unsub_update_after_commit
       return unless ::UnsubUpdateConfig::ENABLED
 
-      # only when digest_after_minutes changed
-      if respond_to?(:saved_change_to_digest_after_minutes?)
-        return unless saved_change_to_digest_after_minutes?
-      else
-        # older rails fallback
-        return unless previous_changes.key?("digest_after_minutes")
-      end
+      # Detect either field changed (because "Never" may flip email_digests, not digest_after_minutes)
+      changed =
+        (respond_to?(:saved_change_to_email_digests?) && saved_change_to_email_digests?) ||
+        (respond_to?(:saved_change_to_digest_after_minutes?) && saved_change_to_digest_after_minutes?) ||
+        (previous_changes.key?("email_digests") || previous_changes.key?("digest_after_minutes"))
 
-      # never == 0
-      return unless digest_after_minutes.to_i <= 0
+      return unless changed
+
+      # Only trigger when state is "never"
+      return unless (email_digests == false || digest_after_minutes.to_i <= 0)
 
       u = self.user
       return if u.nil?
 
-      # If user registered < MIN minutes ago => DO NOTHING
       min_age = ::UnsubUpdateConfig::MIN_MINUTES_SINCE_REGISTRATION.to_i.minutes
-      return if u.created_at.present? && (Time.zone.now - u.created_at) < min_age
+      if u.created_at.present? && (Time.zone.now - u.created_at) < min_age
+        Rails.logger.warn("[unsub-update] SKIP (too new) user_id=#{u.id}")
+        return
+      end
 
+      Rails.logger.warn("[unsub-update] ENQUEUE user_id=#{u.id} email_digests=#{email_digests.inspect} digest_after_minutes=#{digest_after_minutes.inspect}")
       ::Jobs.enqueue(:unsub_update_postback, user_id: u.id)
     end
   end
