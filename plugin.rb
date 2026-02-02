@@ -13,10 +13,10 @@ after_initialize do
   module ::UnsubUpdateConfig
     ENABLED = true
     ENDPOINT_URL = "https://ai.templetrends.com/unsub_update.php"
-    MIN_MINUTES_SINCE_REGISTRATION = 10
+    MIN_MINUTES_SINCE_REGISTRATION = 5
     SHARED_SECRET = ""   # sent as form field "secret"
     OPEN_TIMEOUT_SECONDS = 5
-    READ_TIMEOUT_SECONDS = 10
+    READ_TIMEOUT_SECONDS = 5
   end
 
   def self._unsub_never?(user_option)
