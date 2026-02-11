@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 # name: unsub-update
-# about: Postback when a user sets digest to "Never" via prefs/API. Optional: postback for "email_level never". UI: ticking unsubscribe_all sets digest dropdown to never.
-# version: 1.1.1
+# about: Postback when a user sets digest to "Never" via prefs/API. UI: ticking unsubscribe_all sets digest dropdown to never.
+# version: 1.1.2
 # authors: you
 
 after_initialize do
@@ -14,23 +14,17 @@ after_initialize do
     ENABLED = true
     ENDPOINT_URL = "http://172.17.0.1:8081/unsub_update.php"
     MIN_MINUTES_SINCE_REGISTRATION = 2
-    SHARED_SECRET = ""   # sent as form field "secret"
+    SHARED_SECRET = ""
     OPEN_TIMEOUT_SECONDS = 5
     READ_TIMEOUT_SECONDS = 5
 
-    # UI behavior: disable digest dropdown ONLY after user ticks the checkbox
     UI_DISABLE_DIGEST_DROPDOWN_WHEN_UNSUB_ALL = true
 
-    # IMPORTANT:
-    # Visiting /email/unsubscribe/:key may set email_level=never immediately (one-click unsubscribe in core).
-    # If you don't want "page view" to flip digest settings, keep this FALSE.
+    # Keep safe: do NOT force digest based on email_level changes.
     FORCE_DIGEST_NEVER_WHEN_EMAIL_LEVEL_NEVER = false
-
-    # If you want a postback even when only email_level is set to never (not digest),
-    # enable this and you'll get event=email_level_set_to_never.
     POSTBACK_ON_EMAIL_LEVEL_NEVER = true
 
-    # Only run unsubscribe controller hook on POST (user pressed "save preferences").
+    # Only run unsubscribe controller hook on POST, not page view.
     EMAIL_UNSUB_HOOK_ONLY_ON_POST = true
   end
 
@@ -62,7 +56,6 @@ after_initialize do
       user_option.email_level.to_i == never_val.to_i
     end
 
-    # IMPORTANT: your schema does NOT allow writing updated_at here.
     def self.force_digest_never!(user_option)
       return false if user_option.nil?
 
@@ -90,13 +83,9 @@ after_initialize do
       opt = user.user_option
       event = args[:event].to_s.presence || "digest_set_to_never"
 
-      # For digest events, require digest to be never.
       if event == "digest_set_to_never"
         return unless ::UnsubUpdate.unsub_never?(opt)
-      end
-
-      # For email-level events, require email_level never.
-      if event == "email_level_set_to_never"
+      elsif event == "email_level_set_to_never"
         return unless ::UnsubUpdate.no_mail_enabled?(opt)
       end
 
@@ -142,9 +131,7 @@ after_initialize do
     end
   end
 
-  # -----------------------------
   # 1) Trigger on prefs/API changes
-  # -----------------------------
   UserOption.class_eval do
     after_commit :_unsub_update_after_commit, on: [:update]
 
@@ -170,23 +157,17 @@ after_initialize do
         return
       end
 
-      # If email_level flips to "never", optionally send a separate event.
-      # DO NOT force digest settings unless explicitly enabled.
       if changed_email_level && ::UnsubUpdate.no_mail_enabled?(self)
         if ::UnsubUpdateConfig::FORCE_DIGEST_NEVER_WHEN_EMAIL_LEVEL_NEVER
           forced = ::UnsubUpdate.force_digest_never!(self)
           Rails.logger.warn("[unsub-update] NO-MAIL -> FORCE DIGEST NEVER user_id=#{u.id} forced=#{forced ? 1 : 0} source=user_option_update")
           ::Jobs.enqueue(:unsub_update_postback, user_id: u.id, event: "digest_set_to_never")
-        else
-          Rails.logger.warn("[unsub-update] NO-MAIL (no force) user_id=#{u.id} source=user_option_update")
         end
 
         if ::UnsubUpdateConfig::POSTBACK_ON_EMAIL_LEVEL_NEVER
           Rails.logger.warn("[unsub-update] ENQUEUE email_level_set_to_never user_id=#{u.id} source=user_option_update")
           ::Jobs.enqueue(:unsub_update_postback, user_id: u.id, event: "email_level_set_to_never")
         end
-
-        # Don't fall through to digest logic unless digest actually changed too.
       end
 
       return unless changed_digest
@@ -197,19 +178,14 @@ after_initialize do
     end
   end
 
-  # -----------------------------
-  # 2) Unsubscribe page hook (/email/unsubscribe/:key)
-  #    IMPORTANT: only run on POST (save preferences), otherwise just viewing page can trigger core one-click unsubscribe behavior.
-  # -----------------------------
+  # 2) Trigger on unsubscribe submit (/email/unsubscribe/:key) — POST only
   class ::EmailController
     module ::UnsubUpdateEmailUnsubscribeHook
       def unsubscribe
         super
 
         return unless ::UnsubUpdateConfig::ENABLED
-
         if ::UnsubUpdateConfig::EMAIL_UNSUB_HOOK_ONLY_ON_POST
-          # Only act when user submits preferences, not when merely viewing the page.
           return unless (respond_to?(:request) && request&.post?)
         end
 
@@ -232,15 +208,11 @@ after_initialize do
 
         opt = user.reload.user_option
 
-        # Digest event only if digest is never.
         if ::UnsubUpdate.unsub_never?(opt)
           Rails.logger.warn("[unsub-update] EMAIL-UNSUB ENQUEUE digest_set_to_never user_id=#{user.id}")
           ::Jobs.enqueue(:unsub_update_postback, user_id: user.id, event: "digest_set_to_never")
-        else
-          Rails.logger.warn("[unsub-update] EMAIL-UNSUB no-op user_id=#{user.id} (digest not set to never)")
         end
 
-        # Optional email-level event (independent from digest).
         if ::UnsubUpdateConfig::POSTBACK_ON_EMAIL_LEVEL_NEVER && ::UnsubUpdate.no_mail_enabled?(opt)
           Rails.logger.warn("[unsub-update] EMAIL-UNSUB ENQUEUE email_level_set_to_never user_id=#{user.id}")
           ::Jobs.enqueue(:unsub_update_postback, user_id: user.id, event: "email_level_set_to_never")
@@ -254,24 +226,38 @@ after_initialize do
     prepend ::UnsubUpdateEmailUnsubscribeHook
   end
 
-  # -----------------------------
-  # 3) UI: ONLY when user actively checks the checkbox,
-  #    set dropdown to "never". Do nothing on page load.
-  # -----------------------------
+  # 3) UI injection — move to HEAD and use robust selectors
   begin
     js_disable_dropdown = ::UnsubUpdateConfig::UI_DISABLE_DIGEST_DROPDOWN_WHEN_UNSUB_ALL ? "true" : "false"
 
-    register_html_builder("server:before-body-close") do |_ctx|
+    register_html_builder("server:before-head-close") do |_ctx|
       <<~HTML
         <script>
         (function(){
           try {
-            var path = (location && location.pathname) ? location.pathname : "";
-            if (path.indexOf("/email/unsubscribe/") !== 0) return;
-
             var DISABLE = #{js_disable_dropdown};
 
-            function byId(id){ return document.getElementById(id); }
+            function isUnsubPage(){
+              var p = (location && location.pathname) ? location.pathname : "";
+              return p.indexOf("/email/unsubscribe/") === 0;
+            }
+
+            function q(sel){ try { return document.querySelector(sel); } catch(e){ return null; } }
+
+            function findCheckbox(){
+              // try common ids and names
+              return q("#unsubscribe_all") ||
+                     q("input[name='unsubscribe_all']") ||
+                     q("input#user_option_unsubscribe_all") ||
+                     q("input[name='user_option[unsubscribe_all]']");
+            }
+
+            function findDigestSelect(){
+              return q("#digest_after_minutes") ||
+                     q("select[name='digest_after_minutes']") ||
+                     q("select#user_option_digest_after_minutes") ||
+                     q("select[name='user_option[digest_after_minutes]']");
+            }
 
             function setNever(dd){
               if (!dd) return false;
@@ -284,12 +270,16 @@ after_initialize do
               return true;
             }
 
-            function bind(){
-              var cb = byId("unsubscribe_all");
-              var dd = byId("digest_after_minutes");
+            function bindOnce(){
+              if (!isUnsubPage()) return true;
+
+              var cb = findCheckbox();
+              var dd = findDigestSelect();
+
+              // If no select exists yet, keep trying.
               if (!dd) return false;
 
-              // page variant without checkbox: nothing to do
+              // If no checkbox exists on this variant, nothing to do.
               if (!cb) return true;
 
               if (cb.__unsubUpdateBound) return true;
@@ -304,15 +294,33 @@ after_initialize do
                 }
               });
 
-              // IMPORTANT: no auto-sync on load
               return true;
             }
 
-            var tries = 0;
-            var iv = setInterval(function(){
-              tries++;
-              if (bind() || tries >= 40) clearInterval(iv);
-            }, 100);
+            function start(){
+              // immediate attempt
+              bindOnce();
+
+              // retry loop (covers late DOM)
+              var tries = 0;
+              var iv = setInterval(function(){
+                tries++;
+                if (bindOnce() || tries >= 80) clearInterval(iv);
+              }, 100);
+
+              // mutation observer (covers DOM changes)
+              try {
+                var mo = new MutationObserver(function(){ bindOnce(); });
+                mo.observe(document.documentElement, {subtree:true, childList:true});
+                setTimeout(function(){ try{ mo.disconnect(); }catch(e){} }, 15000);
+              } catch(e) {}
+            }
+
+            if (document.readyState === "loading") {
+              document.addEventListener("DOMContentLoaded", start);
+            } else {
+              start();
+            }
           } catch(e) {}
         })();
         </script>
