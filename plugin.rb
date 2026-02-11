@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 # name: unsub-update
-# about: Postback when a user sets Activity Summary (digest) to "Never" via prefs/API OR via email unsubscribe flow.
-# version: 1.0.4
+# about: Postback when a user disables Activity Summary (digest) OR disables ALL email via checkbox, via Preferences UI or email unsubscribe flow.
+# version: 1.2.0
 # authors: you
 
 after_initialize do
@@ -17,12 +17,32 @@ after_initialize do
     SHARED_SECRET = ""   # sent as form field "secret"
     OPEN_TIMEOUT_SECONDS = 5
     READ_TIMEOUT_SECONDS = 5
+
+    # Fire-once guard (per user per event) so you don’t spam endpoint
+    # Set to false for testing to allow repeated postbacks.
+    ENABLE_FIRE_ONCE_GUARD = false
+
+    STORE_NAMESPACE = "unsub_update"
+
+    # separate keys so each event can fire once independently
+    STORE_KEY_DIGEST_PREFIX    = "sent_digest_never_user_" # + user_id
+    STORE_KEY_ALLMAIL_PREFIX   = "sent_allmail_off_user_"  # + user_id
   end
 
   module ::UnsubUpdate
-    def self.unsub_never?(user_option)
-      return false if user_option.nil?
-      user_option.email_digests == false || user_option.digest_after_minutes.to_i <= 0
+    # Digest "never" detection (your original)
+    def self.digest_never?(opt)
+      return false if opt.nil?
+      opt.email_digests == false || opt.digest_after_minutes.to_i <= 0
+    end
+
+    # "Don’t send me any mail" checkbox:
+    # In many Discourse versions this maps to user_option.email_level == 2 ("never").
+    # We treat >= 2 as "off" to be tolerant if values expand.
+    def self.all_mail_off?(opt)
+      return false if opt.nil?
+      return false unless opt.respond_to?(:email_level)
+      opt.email_level.to_i >= 2
     end
 
     def self.user_too_new?(user)
@@ -30,43 +50,77 @@ after_initialize do
       user.created_at.present? && (Time.zone.now - user.created_at) < min_age
     end
 
-    # Snapshot the only fields we care about, in a nil-safe way.
-    def self.snapshot(opt)
-      {
-        email_digests: (opt&.email_digests.nil? ? nil : !!opt.email_digests),
-        digest_after_minutes: opt&.digest_after_minutes.to_i
-      }
-    end
-
-    def self.snapshot_unsub_never?(snap)
-      return false if snap.nil?
-      snap[:email_digests] == false || snap[:digest_after_minutes].to_i <= 0
-    end
-
-    # True only when we cross from not-never -> never
-    def self.transitioned_to_never?(before_snap, after_snap)
-      !snapshot_unsub_never?(before_snap) && snapshot_unsub_never?(after_snap)
-    end
-
-    def self.safe_user_from_users_controller_params(params)
-      # Discourse typically uses :username in /u/:username, but be defensive.
-      if params[:id].present?
-        u = User.find_by(id: params[:id].to_i)
-        return u if u
-      end
-
-      uname = params[:username].presence || params[:id].presence
-      return nil if uname.blank?
-
-      # find_by_username is nicer if available; fallback to username lookup.
-      if User.respond_to?(:find_by_username)
-        User.find_by_username(uname.to_s)
+    def self.store_key_for(event, user_id)
+      uid = user_id.to_i
+      case event.to_s
+      when "digest_set_to_never"
+        "#{::UnsubUpdateConfig::STORE_KEY_DIGEST_PREFIX}#{uid}"
+      when "all_email_disabled"
+        "#{::UnsubUpdateConfig::STORE_KEY_ALLMAIL_PREFIX}#{uid}"
       else
-        User.find_by(username: uname.to_s)
+        "sent_unknown_#{event}_user_#{uid}"
       end
+    end
+
+    def self.already_sent?(event, user_id)
+      return false unless ::UnsubUpdateConfig::ENABLE_FIRE_ONCE_GUARD
+      PluginStore.get(::UnsubUpdateConfig::STORE_NAMESPACE, store_key_for(event, user_id)).to_s == "1"
     rescue => e
-      Rails.logger.warn("[unsub-update] UsersController resolve user error err=#{e.class}: #{e.message}")
-      nil
+      Rails.logger.warn("[unsub-update] PluginStore get error event=#{event} user_id=#{user_id} err=#{e.class}: #{e.message}")
+      false
+    end
+
+    def self.mark_sent!(event, user_id)
+      return unless ::UnsubUpdateConfig::ENABLE_FIRE_ONCE_GUARD
+      PluginStore.set(::UnsubUpdateConfig::STORE_NAMESPACE, store_key_for(event, user_id), "1")
+    rescue => e
+      Rails.logger.warn("[unsub-update] PluginStore set error event=#{event} user_id=#{user_id} err=#{e.class}: #{e.message}")
+    end
+
+    # Central gate: enqueue if state matches AND (optionally) not sent before.
+    def self.maybe_enqueue_event(user, event:, source:)
+      return unless ::UnsubUpdateConfig::ENABLED
+      return if user.nil? || user.staged? || user.suspended?
+
+      if user_too_new?(user)
+        Rails.logger.warn("[unsub-update] SKIP (too new) user_id=#{user.id} event=#{event} source=#{source}")
+        return
+      end
+
+      opt = user.user_option
+
+      should_fire =
+        case event.to_s
+        when "digest_set_to_never"
+          digest_never?(opt)
+        when "all_email_disabled"
+          all_mail_off?(opt)
+        else
+          false
+        end
+
+      return unless should_fire
+
+      if ::UnsubUpdateConfig::ENABLE_FIRE_ONCE_GUARD && already_sent?(event, user.id)
+        Rails.logger.warn("[unsub-update] NOOP (already sent) user_id=#{user.id} event=#{event} source=#{source}")
+        return
+      end
+
+      Rails.logger.warn("[unsub-update] ENQUEUE user_id=#{user.id} event=#{event} source=#{source} guard=#{::UnsubUpdateConfig::ENABLE_FIRE_ONCE_GUARD ? "on" : "off"}")
+      ::Jobs.enqueue(:unsub_update_postback, user_id: user.id, event: event.to_s, source: source.to_s)
+    rescue => e
+      Rails.logger.warn("[unsub-update] maybe_enqueue_event error user_id=#{user&.id} event=#{event} source=#{source} err=#{e.class}: #{e.message}")
+    end
+
+    # After a user-facing action, check BOTH states and enqueue whichever applies.
+    def self.check_and_enqueue_all(user, source:)
+      return if user.nil?
+      user.reload
+
+      maybe_enqueue_event(user, event: "digest_set_to_never", source: source)
+      maybe_enqueue_event(user, event: "all_email_disabled",  source: source)
+    rescue => e
+      Rails.logger.warn("[unsub-update] check_and_enqueue_all error user_id=#{user&.id} source=#{source} err=#{e.class}: #{e.message}")
     end
   end
 
@@ -77,24 +131,49 @@ after_initialize do
       user = User.find_by(id: args[:user_id].to_i)
       return if user.nil? || user.staged? || user.suspended?
 
-      opt = user.user_option
-      return unless ::UnsubUpdate.unsub_never?(opt)
-
       if ::UnsubUpdate.user_too_new?(user)
-        Rails.logger.warn("[unsub-update] SKIP (too new) user_id=#{user.id}")
+        Rails.logger.warn("[unsub-update] JOB SKIP (too new) user_id=#{user.id}")
+        return
+      end
+
+      event = args[:event].to_s.presence || "digest_set_to_never"
+
+      opt = user.user_option
+
+      # Must still match the event state at execution time
+      still_valid =
+        case event
+        when "digest_set_to_never"
+          ::UnsubUpdate.digest_never?(opt)
+        when "all_email_disabled"
+          ::UnsubUpdate.all_mail_off?(opt)
+        else
+          false
+        end
+
+      return unless still_valid
+
+      if ::UnsubUpdateConfig::ENABLE_FIRE_ONCE_GUARD && ::UnsubUpdate.already_sent?(event, user.id)
+        Rails.logger.warn("[unsub-update] JOB NOOP (already sent) user_id=#{user.id} event=#{event}")
         return
       end
 
       payload = {
-        "event" => "digest_set_to_never",
+        "event" => event,
         "user_id" => user.id.to_s,
         "username" => user.username.to_s,
         "email" => user.email.to_s,
         "registered_at" => (user.created_at&.utc&.iso8601 || ""),
-        "email_digests" => (opt&.email_digests.nil? ? "" : opt.email_digests ? "1" : "0"),
-        "digest_after_minutes" => opt&.digest_after_minutes.to_i.to_s,
         "sent_at_utc" => Time.zone.now.utc.iso8601,
-        "secret" => ::UnsubUpdateConfig::SHARED_SECRET
+        "secret" => ::UnsubUpdateConfig::SHARED_SECRET,
+        "source" => args[:source].to_s,
+        "guard" => (::UnsubUpdateConfig::ENABLE_FIRE_ONCE_GUARD ? "on" : "off"),
+
+        # extra diagnostics (harmless for your PHP side; ignore if you want)
+        "email_level" => (opt.respond_to?(:email_level) ? opt.email_level.to_i.to_s : ""),
+        "email_messages_level" => (opt.respond_to?(:email_messages_level) ? opt.email_messages_level.to_i.to_s : ""),
+        "email_digests" => (opt&.email_digests.nil? ? "" : opt.email_digests ? "1" : "0"),
+        "digest_after_minutes" => opt&.digest_after_minutes.to_i.to_s
       }
 
       uri = URI(::UnsubUpdateConfig::ENDPOINT_URL)
@@ -110,151 +189,99 @@ after_initialize do
       begin
         resp = http.request(req)
         code = resp.code.to_i
+
         if code >= 200 && code < 300
-          Rails.logger.warn("[unsub-update] POST OK user_id=#{user.id} code=#{code}")
+          ::UnsubUpdate.mark_sent!(event, user.id)
+          Rails.logger.warn("[unsub-update] POST OK user_id=#{user.id} event=#{event} code=#{code}")
         else
-          Rails.logger.warn("[unsub-update] POST FAILED user_id=#{user.id} code=#{code} body=#{resp.body.to_s[0, 500]}")
+          Rails.logger.warn("[unsub-update] POST FAILED user_id=#{user.id} event=#{event} code=#{code} body=#{resp.body.to_s[0, 500]}")
         end
       rescue => e
-        Rails.logger.warn("[unsub-update] POST ERROR user_id=#{user.id} err=#{e.class}: #{e.message}")
+        Rails.logger.warn("[unsub-update] POST ERROR user_id=#{user.id} event=#{event} err=#{e.class}: #{e.message}")
       end
     end
   end
 
-  # -----------------------------
-  # 1) Trigger on prefs/API changes (normal path when callbacks fire)
-  # -----------------------------
-  UserOption.class_eval do
-    after_commit :_unsub_update_after_commit, on: [:update]
+  # ============================================================
+  # ✅ HOOK 1: Preferences UI save path (logged-in user)
+  # ============================================================
+  if defined?(::Users::PreferencesController)
+    class ::Users::PreferencesController
+      module ::UnsubUpdateUsersPreferencesControllerHook
+        def update
+          return super unless ::UnsubUpdateConfig::ENABLED
 
-    def _unsub_update_after_commit
-      return unless ::UnsubUpdateConfig::ENABLED
+          # Run Discourse behavior first (we do not alter it)
+          result = super
 
-      changed =
-        (respond_to?(:saved_change_to_email_digests?) && saved_change_to_email_digests?) ||
-        (respond_to?(:saved_change_to_digest_after_minutes?) && saved_change_to_digest_after_minutes?) ||
-        (previous_changes.key?("email_digests") || previous_changes.key?("digest_after_minutes"))
+          begin
+            user = nil
+            user = instance_variable_get(:@user) rescue nil
+            user ||= (respond_to?(:current_user) ? current_user : nil)
 
-      return unless changed
-
-      # Only fire on transition to never, not “still never”
-      before_snap = {
-        email_digests: previous_changes.key?("email_digests") ? previous_changes["email_digests"][0] : email_digests,
-        digest_after_minutes: previous_changes.key?("digest_after_minutes") ? previous_changes["digest_after_minutes"][0].to_i : digest_after_minutes.to_i
-      }
-      after_snap = ::UnsubUpdate.snapshot(self)
-
-      return unless ::UnsubUpdate.transitioned_to_never?(before_snap, after_snap)
-
-      u = self.user
-      return if u.nil?
-
-      if ::UnsubUpdate.user_too_new?(u)
-        Rails.logger.warn("[unsub-update] SKIP (too new) user_id=#{u.id}")
-        return
-      end
-
-      Rails.logger.warn("[unsub-update] ENQUEUE user_id=#{u.id} email_digests=#{email_digests.inspect} digest_after_minutes=#{digest_after_minutes.inspect} source=user_option_update")
-      ::Jobs.enqueue(:unsub_update_postback, user_id: u.id)
-    rescue => e
-      Rails.logger.warn("[unsub-update] after_commit error err=#{e.class}: #{e.message}")
-    end
-  end
-
-  # -----------------------------
-  # 1b) Catch UI/API save path that may bypass UserOption callbacks
-  #     Hook UsersController#update and compare before/after snapshots.
-  # -----------------------------
-  class ::UsersController
-    module ::UnsubUpdateUsersControllerHook
-      def update
-        return super unless ::UnsubUpdateConfig::ENABLED
-
-        # Resolve the target user as best as we can
-        user = instance_variable_get(:@user)
-        user ||= ::UnsubUpdate.safe_user_from_users_controller_params(params)
-
-        before_snap = ::UnsubUpdate.snapshot(user&.user_option)
-
-        result = super
-
-        begin
-          # Reload after update
-          user = instance_variable_get(:@user) || user
-          user&.reload
-          after_snap = ::UnsubUpdate.snapshot(user&.user_option)
-
-          if user && !user.staged? && !user.suspended? &&
-             ::UnsubUpdate.transitioned_to_never?(before_snap, after_snap)
-
-            if ::UnsubUpdate.user_too_new?(user)
-              Rails.logger.warn("[unsub-update] UsersController SKIP (too new) user_id=#{user.id}")
-            else
-              Rails.logger.warn("[unsub-update] UsersController ENQUEUE user_id=#{user.id} source=users_controller_update")
-              ::Jobs.enqueue(:unsub_update_postback, user_id: user.id)
-            end
+            ::UnsubUpdate.check_and_enqueue_all(user, source: "users_preferences_update")
+          rescue => e
+            Rails.logger.warn("[unsub-update] Users::PreferencesController hook error err=#{e.class}: #{e.message}")
           end
-        rescue => e
-          Rails.logger.warn("[unsub-update] UsersController hook error err=#{e.class}: #{e.message}")
+
+          result
         end
-
-        result
       end
-    end
 
-    prepend ::UnsubUpdateUsersControllerHook
+      prepend ::UnsubUpdateUsersPreferencesControllerHook
+    end
+  else
+    Rails.logger.warn("[unsub-update] Users::PreferencesController not defined; prefs UI hook not installed")
   end
 
-  # -----------------------------
-  # 2) Trigger on email unsubscribe clicks (/email/unsubscribe/:key)
-  #    Only fire if it transitions to never.
-  # -----------------------------
+  # ============================================================
+  # ✅ HOOK 2: Email unsubscribe flow
+  # ============================================================
   class ::EmailController
-    module ::UnsubUpdateEmailUnsubscribeHook
+    module ::UnsubUpdateEmailHook
       def unsubscribe
         return super unless ::UnsubUpdateConfig::ENABLED
-
-        # Resolve user from key BEFORE super so we can compare before/after.
-        user = nil
-        begin
-          if defined?(::UnsubscribeKey)
-            k = ::UnsubscribeKey.includes(:user).find_by(key: params[:key].to_s)
-            user = k&.user
-          end
-        rescue => e
-          Rails.logger.warn("[unsub-update] EMAIL-UNSUB resolve key error err=#{e.class}: #{e.message}")
-        end
-
-        before_snap = ::UnsubUpdate.snapshot(user&.user_option)
-
         result = super
 
         begin
-          return result if user.nil? || user.staged? || user.suspended?
-
-          user.reload
-          after_snap = ::UnsubUpdate.snapshot(user.user_option)
-
-          unless ::UnsubUpdate.transitioned_to_never?(before_snap, after_snap)
-            Rails.logger.warn("[unsub-update] EMAIL-UNSUB no-op user_id=#{user.id} (no transition to never)")
-            return result
-          end
-
-          if ::UnsubUpdate.user_too_new?(user)
-            Rails.logger.warn("[unsub-update] EMAIL-UNSUB SKIP (too new) user_id=#{user.id}")
-            return result
-          end
-
-          Rails.logger.warn("[unsub-update] EMAIL-UNSUB ENQUEUE user_id=#{user.id}")
-          ::Jobs.enqueue(:unsub_update_postback, user_id: user.id)
+          user = resolve_user_from_unsub_key(params[:key])
+          ::UnsubUpdate.check_and_enqueue_all(user, source: "email_unsubscribe")
         rescue => e
-          Rails.logger.warn("[unsub-update] EMAIL-UNSUB hook error err=#{e.class}: #{e.message}")
+          Rails.logger.warn("[unsub-update] EMAIL unsubscribe hook error err=#{e.class}: #{e.message}")
         end
 
         result
       end
+
+      # Some Discourse versions do the actual state change here.
+      def perform_unsubscribe
+        return super unless ::UnsubUpdateConfig::ENABLED
+        result = super
+
+        begin
+          user = resolve_user_from_unsub_key(params[:key])
+          ::UnsubUpdate.check_and_enqueue_all(user, source: "email_perform_unsubscribe")
+        rescue => e
+          Rails.logger.warn("[unsub-update] EMAIL perform_unsubscribe hook error err=#{e.class}: #{e.message}")
+        end
+
+        result
+      end
+
+      private
+
+      def resolve_user_from_unsub_key(key)
+        return nil if key.blank?
+        return nil unless defined?(::UnsubscribeKey)
+
+        k = ::UnsubscribeKey.includes(:user).find_by(key: key.to_s)
+        k&.user
+      rescue => e
+        Rails.logger.warn("[unsub-update] EMAIL resolve key error err=#{e.class}: #{e.message}")
+        nil
+      end
     end
 
-    prepend ::UnsubUpdateEmailUnsubscribeHook
+    prepend ::UnsubUpdateEmailHook
   end
 end
