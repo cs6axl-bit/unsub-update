@@ -1,9 +1,8 @@
 # frozen_string_literal: true
 
 # name: unsub-update
-# about: Postback when a user sets Activity Summary (digest) to "Never" via prefs/API OR via email unsubscribe flow.
-#        ALSO: if user checks "Don’t send me any mail from ..." (email_level: never), force digest to Never too.
-# version: 1.0.4
+# about: Postback when a user sets digest to "Never" via prefs/API or unsubscribe page. Also sync unsubscribe checkbox to digest dropdown in UI.
+# version: 1.0.9
 # authors: you
 
 after_initialize do
@@ -18,6 +17,9 @@ after_initialize do
     SHARED_SECRET = ""   # sent as form field "secret"
     OPEN_TIMEOUT_SECONDS = 5
     READ_TIMEOUT_SECONDS = 5
+
+    # UI behavior on unsubscribe page
+    UI_DISABLE_DIGEST_DROPDOWN_WHEN_UNSUB_ALL = true
   end
 
   module ::UnsubUpdate
@@ -31,7 +33,6 @@ after_initialize do
       user.created_at.present? && (Time.zone.now - user.created_at) < min_age
     end
 
-    # "Don’t send me any mail from this site" checkbox (global email off)
     def self.no_mail_enabled?(user_option)
       return false if user_option.nil?
       return false unless user_option.respond_to?(:email_level)
@@ -49,7 +50,7 @@ after_initialize do
       user_option.email_level.to_i == never_val.to_i
     end
 
-    # Force digest settings to "Never" so your system has a consistent signal
+    # IMPORTANT: your schema does NOT allow writing updated_at here.
     def self.force_digest_never!(user_option)
       return false if user_option.nil?
 
@@ -61,8 +62,7 @@ after_initialize do
 
       user_option.update_columns(
         email_digests: false,
-        digest_after_minutes: 0,
-        updated_at: Time.zone.now
+        digest_after_minutes: 0
       )
       true
     end
@@ -128,27 +128,25 @@ after_initialize do
     def _unsub_update_after_commit
       return unless ::UnsubUpdateConfig::ENABLED
 
-      changed =
+      changed_digest =
         (respond_to?(:saved_change_to_email_digests?) && saved_change_to_email_digests?) ||
         (respond_to?(:saved_change_to_digest_after_minutes?) && saved_change_to_digest_after_minutes?) ||
         (previous_changes.key?("email_digests") || previous_changes.key?("digest_after_minutes"))
 
-      # ALSO react to checkbox (email_level) when changed via prefs/API
       changed_email_level =
         (respond_to?(:saved_change_to_email_level?) && saved_change_to_email_level?) ||
         previous_changes.key?("email_level")
 
-      return unless (changed || changed_email_level)
+      return unless (changed_digest || changed_email_level)
 
       u = self.user
-      return if u.nil?
+      return if u.nil? || u.staged? || u.suspended?
 
       if ::UnsubUpdate.user_too_new?(u)
         Rails.logger.warn("[unsub-update] SKIP (too new) user_id=#{u.id}")
         return
       end
 
-      # If checkbox turned on (no mail), force digest never and enqueue
       if changed_email_level && ::UnsubUpdate.no_mail_enabled?(self)
         forced = ::UnsubUpdate.force_digest_never!(self)
         Rails.logger.warn("[unsub-update] NO-MAIL -> FORCE DIGEST NEVER user_id=#{u.id} forced=#{forced ? 1 : 0} source=user_option_update")
@@ -156,16 +154,16 @@ after_initialize do
         return
       end
 
+      return unless changed_digest
       return unless ::UnsubUpdate.unsub_never?(self)
 
-      Rails.logger.warn("[unsub-update] ENQUEUE user_id=#{u.id} email_digests=#{email_digests.inspect} digest_after_minutes=#{digest_after_minutes.inspect} source=user_option_update")
+      Rails.logger.warn("[unsub-update] ENQUEUE user_id=#{u.id} source=user_option_update")
       ::Jobs.enqueue(:unsub_update_postback, user_id: u.id)
     end
   end
 
   # -----------------------------
-  # 2) Trigger on email unsubscribe clicks (/email/unsubscribe/:key)
-  #    Keep your interception (it works), and add checkbox logic safely.
+  # 2) Trigger on unsubscribe page submit (/email/unsubscribe/:key)
   # -----------------------------
   class ::EmailController
     module ::UnsubUpdateEmailUnsubscribeHook
@@ -193,7 +191,6 @@ after_initialize do
 
         opt = user.reload.user_option
 
-        # If checkbox (global email off) is enabled, force digest never and enqueue
         if ::UnsubUpdate.no_mail_enabled?(opt)
           forced = ::UnsubUpdate.force_digest_never!(opt)
           Rails.logger.warn("[unsub-update] EMAIL-UNSUB NO-MAIL -> FORCE DIGEST NEVER user_id=#{user.id} forced=#{forced ? 1 : 0}")
@@ -209,12 +206,82 @@ after_initialize do
         Rails.logger.warn("[unsub-update] EMAIL-UNSUB ENQUEUE user_id=#{user.id}")
         ::Jobs.enqueue(:unsub_update_postback, user_id: user.id)
       rescue => e
-        # absolutely never break the unsubscribe page
         Rails.logger.warn("[unsub-update] EMAIL-UNSUB HOOK ERROR err=#{e.class}: #{e.message}")
         nil
       end
     end
 
     prepend ::UnsubUpdateEmailUnsubscribeHook
+  end
+
+  # -----------------------------
+  # 3) UI: if checkbox #unsubscribe_all exists and is checked,
+  #    auto-set dropdown #digest_after_minutes to value "0" (never).
+  #    This is guaranteed to match your HTML.
+  # -----------------------------
+  begin
+    js_disable_dropdown = ::UnsubUpdateConfig::UI_DISABLE_DIGEST_DROPDOWN_WHEN_UNSUB_ALL ? "true" : "false"
+
+    register_html_builder("server:before-body-close") do |_ctx|
+      <<~HTML
+        <script>
+        (function(){
+          try {
+            var path = (location && location.pathname) ? location.pathname : "";
+            if (path.indexOf("/email/unsubscribe/") !== 0) return;
+
+            var DISABLE = #{js_disable_dropdown};
+
+            function byId(id){ return document.getElementById(id); }
+
+            function setNever(dd){
+              if (!dd) return false;
+              var v = "0";
+              if (dd.value !== v) {
+                dd.value = v;
+                try { dd.dispatchEvent(new Event("change", {bubbles:true})); } catch(e) {}
+                try { dd.dispatchEvent(new Event("input", {bubbles:true})); } catch(e) {}
+              }
+              return true;
+            }
+
+            function bind(){
+              var cb = byId("unsubscribe_all");
+              var dd = byId("digest_after_minutes");
+              if (!dd) return false;
+
+              // If no checkbox on this template, nothing to do
+              if (!cb) return true;
+
+              if (cb.__unsubUpdateBound) return true;
+              cb.__unsubUpdateBound = true;
+
+              var sync = function(){
+                if (cb.checked){
+                  setNever(dd);
+                  if (DISABLE) dd.disabled = true;
+                } else {
+                  if (DISABLE) dd.disabled = false;
+                }
+              };
+
+              cb.addEventListener("change", sync);
+              sync();
+              return true;
+            }
+
+            // short retry loop (server page, but safe)
+            var tries = 0;
+            var iv = setInterval(function(){
+              tries++;
+              if (bind() || tries >= 40) clearInterval(iv);
+            }, 100);
+          } catch(e) {}
+        })();
+        </script>
+      HTML
+    end
+  rescue => e
+    Rails.logger.warn("[unsub-update] UI inject error err=#{e.class}: #{e.message}")
   end
 end
