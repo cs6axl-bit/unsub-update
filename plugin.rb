@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 # name: unsub-update
-# about: Postback when a user sets digest to "Never" via prefs/API or unsubscribe page. Also sync unsubscribe checkbox to digest dropdown in UI.
-# version: 1.0.9
+# about: Postback when a user sets digest to "Never" via prefs/API or unsubscribe page. Also UI: ticking unsubscribe_all sets digest dropdown to never.
+# version: 1.1.0
 # authors: you
 
 after_initialize do
@@ -18,7 +18,7 @@ after_initialize do
     OPEN_TIMEOUT_SECONDS = 5
     READ_TIMEOUT_SECONDS = 5
 
-    # UI behavior on unsubscribe page
+    # UI behavior: disable digest dropdown ONLY after user ticks the checkbox
     UI_DISABLE_DIGEST_DROPDOWN_WHEN_UNSUB_ALL = true
   end
 
@@ -120,7 +120,7 @@ after_initialize do
   end
 
   # -----------------------------
-  # 1) Trigger on prefs/API changes (normal path)
+  # 1) Trigger on prefs/API changes
   # -----------------------------
   UserOption.class_eval do
     after_commit :_unsub_update_after_commit, on: [:update]
@@ -215,9 +215,8 @@ after_initialize do
   end
 
   # -----------------------------
-  # 3) UI: if checkbox #unsubscribe_all exists and is checked,
-  #    auto-set dropdown #digest_after_minutes to value "0" (never).
-  #    This is guaranteed to match your HTML.
+  # 3) UI: ONLY when user actively checks the checkbox,
+  #    set dropdown to "never". Do nothing on page load.
   # -----------------------------
   begin
     js_disable_dropdown = ::UnsubUpdateConfig::UI_DISABLE_DIGEST_DROPDOWN_WHEN_UNSUB_ALL ? "true" : "false"
@@ -250,27 +249,25 @@ after_initialize do
               var dd = byId("digest_after_minutes");
               if (!dd) return false;
 
-              // If no checkbox on this template, nothing to do
+              // page variant without checkbox: nothing to do
               if (!cb) return true;
 
               if (cb.__unsubUpdateBound) return true;
               cb.__unsubUpdateBound = true;
 
-              var sync = function(){
-                if (cb.checked){
+              cb.addEventListener("change", function(){
+                if (cb.checked) {
                   setNever(dd);
                   if (DISABLE) dd.disabled = true;
                 } else {
                   if (DISABLE) dd.disabled = false;
                 }
-              };
+              });
 
-              cb.addEventListener("change", sync);
-              sync();
+              // IMPORTANT: no auto-sync on load
               return true;
             }
 
-            // short retry loop (server page, but safe)
             var tries = 0;
             var iv = setInterval(function(){
               tries++;
