@@ -2,8 +2,8 @@
 
 # name: unsub-update
 # about: Postback when a user sets Activity Summary (digest) to "Never" via prefs/API OR via email unsubscribe flow.
-#        ALSO: if user enables "no mail from site", force digest to Never too.
-# version: 1.1.2
+#        ALSO: if user checks "Don’t send me any mail from ..." (email_level: never), force digest to Never too.
+# version: 1.0.4
 # authors: you
 
 after_initialize do
@@ -31,34 +31,25 @@ after_initialize do
       user.created_at.present? && (Time.zone.now - user.created_at) < min_age
     end
 
+    # "Don’t send me any mail from this site" checkbox (global email off)
     def self.no_mail_enabled?(user_option)
       return false if user_option.nil?
       return false unless user_option.respond_to?(:email_level)
 
-      types = user_option.class.respond_to?(:email_level_types) ? user_option.class.email_level_types : {}
-      never_val = types && types[:never]
+      types =
+        if user_option.class.respond_to?(:email_level_types)
+          user_option.class.email_level_types
+        else
+          {}
+        end
+
+      never_val = types[:never]
       return false if never_val.nil?
 
       user_option.email_level.to_i == never_val.to_i
     end
 
-    # guard against recursion in thread (mostly for safety)
-    def self.guard_key
-      :_unsub_update_guard
-    end
-
-    def self.with_guard
-      Thread.current[guard_key] ||= 0
-      Thread.current[guard_key] += 1
-      yield
-    ensure
-      Thread.current[guard_key] -= 1
-    end
-
-    def self.guarded?
-      Thread.current[guard_key].to_i > 0
-    end
-
+    # Force digest settings to "Never" so your system has a consistent signal
     def self.force_digest_never!(user_option)
       return false if user_option.nil?
 
@@ -136,101 +127,94 @@ after_initialize do
 
     def _unsub_update_after_commit
       return unless ::UnsubUpdateConfig::ENABLED
-      return if ::UnsubUpdate.guarded?
+
+      changed =
+        (respond_to?(:saved_change_to_email_digests?) && saved_change_to_email_digests?) ||
+        (respond_to?(:saved_change_to_digest_after_minutes?) && saved_change_to_digest_after_minutes?) ||
+        (previous_changes.key?("email_digests") || previous_changes.key?("digest_after_minutes"))
+
+      # ALSO react to checkbox (email_level) when changed via prefs/API
+      changed_email_level =
+        (respond_to?(:saved_change_to_email_level?) && saved_change_to_email_level?) ||
+        previous_changes.key?("email_level")
+
+      return unless (changed || changed_email_level)
 
       u = self.user
-      return if u.nil? || u.staged? || u.suspended?
+      return if u.nil?
 
       if ::UnsubUpdate.user_too_new?(u)
         Rails.logger.warn("[unsub-update] SKIP (too new) user_id=#{u.id}")
         return
       end
 
-      changed_digest =
-        (respond_to?(:saved_change_to_email_digests?) && saved_change_to_email_digests?) ||
-        (respond_to?(:saved_change_to_digest_after_minutes?) && saved_change_to_digest_after_minutes?) ||
-        (previous_changes.key?("email_digests") || previous_changes.key?("digest_after_minutes"))
-
-      changed_email_level =
-        (respond_to?(:saved_change_to_email_level?) && saved_change_to_email_level?) ||
-        previous_changes.key?("email_level")
-
-      ::UnsubUpdate.with_guard do
-        if changed_email_level && ::UnsubUpdate.no_mail_enabled?(self)
-          forced = ::UnsubUpdate.force_digest_never!(self)
-          Rails.logger.warn("[unsub-update] NO-MAIL -> FORCE DIGEST NEVER user_id=#{u.id} forced=#{forced ? 1 : 0} source=user_option_update")
-          ::Jobs.enqueue(:unsub_update_postback, user_id: u.id)
-          return
-        end
-
-        return unless changed_digest
-        return unless ::UnsubUpdate.unsub_never?(self)
-
-        Rails.logger.warn("[unsub-update] ENQUEUE user_id=#{u.id} source=user_option_update")
+      # If checkbox turned on (no mail), force digest never and enqueue
+      if changed_email_level && ::UnsubUpdate.no_mail_enabled?(self)
+        forced = ::UnsubUpdate.force_digest_never!(self)
+        Rails.logger.warn("[unsub-update] NO-MAIL -> FORCE DIGEST NEVER user_id=#{u.id} forced=#{forced ? 1 : 0} source=user_option_update")
         ::Jobs.enqueue(:unsub_update_postback, user_id: u.id)
+        return
       end
-    rescue => e
-      Rails.logger.warn("[unsub-update] CALLBACK ERROR user_id=#{u&.id} err=#{e.class}: #{e.message}")
+
+      return unless ::UnsubUpdate.unsub_never?(self)
+
+      Rails.logger.warn("[unsub-update] ENQUEUE user_id=#{u.id} email_digests=#{email_digests.inspect} digest_after_minutes=#{digest_after_minutes.inspect} source=user_option_update")
+      ::Jobs.enqueue(:unsub_update_postback, user_id: u.id)
     end
   end
 
   # -----------------------------
-  # 2) Trigger via unsubscribe page submit
-  #    (This flow can bypass UserOption callbacks, so we hook controller safely.)
+  # 2) Trigger on email unsubscribe clicks (/email/unsubscribe/:key)
+  #    Keep your interception (it works), and add checkbox logic safely.
   # -----------------------------
-  if defined?(::EmailController)
-    ::EmailController.class_eval do
-      module ::UnsubUpdateEmailControllerHook
-        def unsubscribe
-          user = nil
+  class ::EmailController
+    module ::UnsubUpdateEmailUnsubscribeHook
+      def unsubscribe
+        super
 
-          # Resolve user BEFORE super (super may mutate/delete/consume key)
-          begin
-            if defined?(::UnsubscribeKey)
-              k = ::UnsubscribeKey.includes(:user).find_by(key: params[:key].to_s)
-              user = k&.user
-            end
-          rescue => e
-            Rails.logger.warn("[unsub-update] EMAIL-UNSUB resolve key error err=#{e.class}: #{e.message}")
+        return unless ::UnsubUpdateConfig::ENABLED
+
+        user = nil
+        begin
+          if defined?(::UnsubscribeKey)
+            k = ::UnsubscribeKey.includes(:user).find_by(key: params[:key].to_s)
+            user = k&.user
           end
-
-          super
-        ensure
-          begin
-            return unless ::UnsubUpdateConfig::ENABLED
-
-            # Only on submit requests, not the initial GET page view
-            if respond_to?(:request) && !(request.post? || request.put? || request.patch?)
-              next
-            end
-
-            return if user.nil? || user.staged? || user.suspended?
-            return if ::UnsubUpdate.user_too_new?(user)
-
-            opt = user.reload.user_option
-
-            if ::UnsubUpdate.no_mail_enabled?(opt)
-              forced = ::UnsubUpdate.force_digest_never!(opt)
-              Rails.logger.warn("[unsub-update] EMAIL-UNSUB NO-MAIL -> FORCE DIGEST NEVER user_id=#{user.id} forced=#{forced ? 1 : 0}")
-              ::Jobs.enqueue(:unsub_update_postback, user_id: user.id)
-              next
-            end
-
-            if ::UnsubUpdate.unsub_never?(opt)
-              Rails.logger.warn("[unsub-update] EMAIL-UNSUB ENQUEUE user_id=#{user.id}")
-              ::Jobs.enqueue(:unsub_update_postback, user_id: user.id)
-            else
-              Rails.logger.warn("[unsub-update] EMAIL-UNSUB no-op user_id=#{user.id} (digest not set to never)")
-            end
-          rescue => e
-            Rails.logger.warn("[unsub-update] EMAIL-UNSUB hook error err=#{e.class}: #{e.message}")
-          end
+        rescue => e
+          Rails.logger.warn("[unsub-update] EMAIL-UNSUB resolve key error err=#{e.class}: #{e.message}")
         end
-      end
 
-      prepend ::UnsubUpdateEmailControllerHook
+        return if user.nil? || user.staged? || user.suspended?
+
+        if ::UnsubUpdate.user_too_new?(user)
+          Rails.logger.warn("[unsub-update] EMAIL-UNSUB SKIP (too new) user_id=#{user.id}")
+          return
+        end
+
+        opt = user.reload.user_option
+
+        # If checkbox (global email off) is enabled, force digest never and enqueue
+        if ::UnsubUpdate.no_mail_enabled?(opt)
+          forced = ::UnsubUpdate.force_digest_never!(opt)
+          Rails.logger.warn("[unsub-update] EMAIL-UNSUB NO-MAIL -> FORCE DIGEST NEVER user_id=#{user.id} forced=#{forced ? 1 : 0}")
+          ::Jobs.enqueue(:unsub_update_postback, user_id: user.id)
+          return
+        end
+
+        unless ::UnsubUpdate.unsub_never?(opt)
+          Rails.logger.warn("[unsub-update] EMAIL-UNSUB no-op user_id=#{user.id} (digest not set to never)")
+          return
+        end
+
+        Rails.logger.warn("[unsub-update] EMAIL-UNSUB ENQUEUE user_id=#{user.id}")
+        ::Jobs.enqueue(:unsub_update_postback, user_id: user.id)
+      rescue => e
+        # absolutely never break the unsubscribe page
+        Rails.logger.warn("[unsub-update] EMAIL-UNSUB HOOK ERROR err=#{e.class}: #{e.message}")
+        nil
+      end
     end
-  else
-    Rails.logger.warn("[unsub-update] NOTE: EmailController not defined; unsubscribe-page hook not installed")
+
+    prepend ::UnsubUpdateEmailUnsubscribeHook
   end
 end
