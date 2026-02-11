@@ -13,7 +13,7 @@ after_initialize do
   module ::UnsubUpdateConfig
     ENABLED = true
     ENDPOINT_URL = "http://172.17.0.1:8081/unsub_update.php"
-    MIN_MINUTES_SINCE_REGISTRATION = 5
+    MIN_MINUTES_SINCE_REGISTRATION = 2
     SHARED_SECRET = ""   # sent as form field "secret"
     OPEN_TIMEOUT_SECONDS = 5
     READ_TIMEOUT_SECONDS = 5
