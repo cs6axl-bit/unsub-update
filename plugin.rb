@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 # name: unsub-update
-# about: Postback when a user sets digest to "Never" via prefs/API or unsubscribe page. Also UI: ticking unsubscribe_all sets digest dropdown to never.
-# version: 1.1.0
+# about: Postback when a user sets digest to "Never" via prefs/API. Optional: postback for "email_level never". UI: ticking unsubscribe_all sets digest dropdown to never.
+# version: 1.1.1
 # authors: you
 
 after_initialize do
@@ -20,6 +20,18 @@ after_initialize do
 
     # UI behavior: disable digest dropdown ONLY after user ticks the checkbox
     UI_DISABLE_DIGEST_DROPDOWN_WHEN_UNSUB_ALL = true
+
+    # IMPORTANT:
+    # Visiting /email/unsubscribe/:key may set email_level=never immediately (one-click unsubscribe in core).
+    # If you don't want "page view" to flip digest settings, keep this FALSE.
+    FORCE_DIGEST_NEVER_WHEN_EMAIL_LEVEL_NEVER = false
+
+    # If you want a postback even when only email_level is set to never (not digest),
+    # enable this and you'll get event=email_level_set_to_never.
+    POSTBACK_ON_EMAIL_LEVEL_NEVER = true
+
+    # Only run unsubscribe controller hook on POST (user pressed "save preferences").
+    EMAIL_UNSUB_HOOK_ONLY_ON_POST = true
   end
 
   module ::UnsubUpdate
@@ -76,19 +88,30 @@ after_initialize do
       return if user.nil? || user.staged? || user.suspended?
 
       opt = user.user_option
-      return unless ::UnsubUpdate.unsub_never?(opt)
+      event = args[:event].to_s.presence || "digest_set_to_never"
+
+      # For digest events, require digest to be never.
+      if event == "digest_set_to_never"
+        return unless ::UnsubUpdate.unsub_never?(opt)
+      end
+
+      # For email-level events, require email_level never.
+      if event == "email_level_set_to_never"
+        return unless ::UnsubUpdate.no_mail_enabled?(opt)
+      end
 
       if ::UnsubUpdate.user_too_new?(user)
-        Rails.logger.warn("[unsub-update] SKIP (too new) user_id=#{user.id}")
+        Rails.logger.warn("[unsub-update] SKIP (too new) user_id=#{user.id} event=#{event}")
         return
       end
 
       payload = {
-        "event" => "digest_set_to_never",
+        "event" => event,
         "user_id" => user.id.to_s,
         "username" => user.username.to_s,
         "email" => user.email.to_s,
         "registered_at" => (user.created_at&.utc&.iso8601 || ""),
+        "email_level" => (opt&.respond_to?(:email_level) ? opt.email_level.to_i.to_s : ""),
         "email_digests" => (opt&.email_digests.nil? ? "" : opt.email_digests ? "1" : "0"),
         "digest_after_minutes" => opt&.digest_after_minutes.to_i.to_s,
         "sent_at_utc" => Time.zone.now.utc.iso8601,
@@ -109,12 +132,12 @@ after_initialize do
         resp = http.request(req)
         code = resp.code.to_i
         if code >= 200 && code < 300
-          Rails.logger.warn("[unsub-update] POST OK user_id=#{user.id} code=#{code}")
+          Rails.logger.warn("[unsub-update] POST OK user_id=#{user.id} event=#{event} code=#{code}")
         else
-          Rails.logger.warn("[unsub-update] POST FAILED user_id=#{user.id} code=#{code} body=#{resp.body.to_s[0, 500]}")
+          Rails.logger.warn("[unsub-update] POST FAILED user_id=#{user.id} event=#{event} code=#{code} body=#{resp.body.to_s[0, 500]}")
         end
       rescue => e
-        Rails.logger.warn("[unsub-update] POST ERROR user_id=#{user.id} err=#{e.class}: #{e.message}")
+        Rails.logger.warn("[unsub-update] POST ERROR user_id=#{user.id} event=#{event} err=#{e.class}: #{e.message}")
       end
     end
   end
@@ -147,23 +170,36 @@ after_initialize do
         return
       end
 
+      # If email_level flips to "never", optionally send a separate event.
+      # DO NOT force digest settings unless explicitly enabled.
       if changed_email_level && ::UnsubUpdate.no_mail_enabled?(self)
-        forced = ::UnsubUpdate.force_digest_never!(self)
-        Rails.logger.warn("[unsub-update] NO-MAIL -> FORCE DIGEST NEVER user_id=#{u.id} forced=#{forced ? 1 : 0} source=user_option_update")
-        ::Jobs.enqueue(:unsub_update_postback, user_id: u.id)
-        return
+        if ::UnsubUpdateConfig::FORCE_DIGEST_NEVER_WHEN_EMAIL_LEVEL_NEVER
+          forced = ::UnsubUpdate.force_digest_never!(self)
+          Rails.logger.warn("[unsub-update] NO-MAIL -> FORCE DIGEST NEVER user_id=#{u.id} forced=#{forced ? 1 : 0} source=user_option_update")
+          ::Jobs.enqueue(:unsub_update_postback, user_id: u.id, event: "digest_set_to_never")
+        else
+          Rails.logger.warn("[unsub-update] NO-MAIL (no force) user_id=#{u.id} source=user_option_update")
+        end
+
+        if ::UnsubUpdateConfig::POSTBACK_ON_EMAIL_LEVEL_NEVER
+          Rails.logger.warn("[unsub-update] ENQUEUE email_level_set_to_never user_id=#{u.id} source=user_option_update")
+          ::Jobs.enqueue(:unsub_update_postback, user_id: u.id, event: "email_level_set_to_never")
+        end
+
+        # Don't fall through to digest logic unless digest actually changed too.
       end
 
       return unless changed_digest
       return unless ::UnsubUpdate.unsub_never?(self)
 
-      Rails.logger.warn("[unsub-update] ENQUEUE user_id=#{u.id} source=user_option_update")
-      ::Jobs.enqueue(:unsub_update_postback, user_id: u.id)
+      Rails.logger.warn("[unsub-update] ENQUEUE digest_set_to_never user_id=#{u.id} source=user_option_update")
+      ::Jobs.enqueue(:unsub_update_postback, user_id: u.id, event: "digest_set_to_never")
     end
   end
 
   # -----------------------------
-  # 2) Trigger on unsubscribe page submit (/email/unsubscribe/:key)
+  # 2) Unsubscribe page hook (/email/unsubscribe/:key)
+  #    IMPORTANT: only run on POST (save preferences), otherwise just viewing page can trigger core one-click unsubscribe behavior.
   # -----------------------------
   class ::EmailController
     module ::UnsubUpdateEmailUnsubscribeHook
@@ -171,6 +207,11 @@ after_initialize do
         super
 
         return unless ::UnsubUpdateConfig::ENABLED
+
+        if ::UnsubUpdateConfig::EMAIL_UNSUB_HOOK_ONLY_ON_POST
+          # Only act when user submits preferences, not when merely viewing the page.
+          return unless (respond_to?(:request) && request&.post?)
+        end
 
         user = nil
         begin
@@ -191,20 +232,19 @@ after_initialize do
 
         opt = user.reload.user_option
 
-        if ::UnsubUpdate.no_mail_enabled?(opt)
-          forced = ::UnsubUpdate.force_digest_never!(opt)
-          Rails.logger.warn("[unsub-update] EMAIL-UNSUB NO-MAIL -> FORCE DIGEST NEVER user_id=#{user.id} forced=#{forced ? 1 : 0}")
-          ::Jobs.enqueue(:unsub_update_postback, user_id: user.id)
-          return
-        end
-
-        unless ::UnsubUpdate.unsub_never?(opt)
+        # Digest event only if digest is never.
+        if ::UnsubUpdate.unsub_never?(opt)
+          Rails.logger.warn("[unsub-update] EMAIL-UNSUB ENQUEUE digest_set_to_never user_id=#{user.id}")
+          ::Jobs.enqueue(:unsub_update_postback, user_id: user.id, event: "digest_set_to_never")
+        else
           Rails.logger.warn("[unsub-update] EMAIL-UNSUB no-op user_id=#{user.id} (digest not set to never)")
-          return
         end
 
-        Rails.logger.warn("[unsub-update] EMAIL-UNSUB ENQUEUE user_id=#{user.id}")
-        ::Jobs.enqueue(:unsub_update_postback, user_id: user.id)
+        # Optional email-level event (independent from digest).
+        if ::UnsubUpdateConfig::POSTBACK_ON_EMAIL_LEVEL_NEVER && ::UnsubUpdate.no_mail_enabled?(opt)
+          Rails.logger.warn("[unsub-update] EMAIL-UNSUB ENQUEUE email_level_set_to_never user_id=#{user.id}")
+          ::Jobs.enqueue(:unsub_update_postback, user_id: user.id, event: "email_level_set_to_never")
+        end
       rescue => e
         Rails.logger.warn("[unsub-update] EMAIL-UNSUB HOOK ERROR err=#{e.class}: #{e.message}")
         nil
