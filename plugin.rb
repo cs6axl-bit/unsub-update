@@ -2,7 +2,7 @@
 
 # name: unsub-update
 # about: Postback when a user disables Activity Summary (digest) OR disables ALL email via checkbox, via Preferences UI or email unsubscribe flow.
-# version: 1.2.0
+# version: 1.2.1
 # authors: you
 
 after_initialize do
@@ -25,8 +25,8 @@ after_initialize do
     STORE_NAMESPACE = "unsub_update"
 
     # separate keys so each event can fire once independently
-    STORE_KEY_DIGEST_PREFIX    = "sent_digest_never_user_" # + user_id
-    STORE_KEY_ALLMAIL_PREFIX   = "sent_allmail_off_user_"  # + user_id
+    STORE_KEY_DIGEST_PREFIX  = "sent_digest_never_user_" # + user_id
+    STORE_KEY_ALLMAIL_PREFIX = "sent_allmail_off_user_"  # + user_id
   end
 
   module ::UnsubUpdate
@@ -36,13 +36,17 @@ after_initialize do
       opt.email_digests == false || opt.digest_after_minutes.to_i <= 0
     end
 
-    # "Don’t send me any mail" checkbox:
-    # In many Discourse versions this maps to user_option.email_level == 2 ("never").
-    # We treat >= 2 as "off" to be tolerant if values expand.
+    # "Don't send me any mail" = require BOTH notification emails and PM emails to be "never" (when available).
+    # This prevents false positives when only email_level is "never" but PM emails / digests are still enabled.
     def self.all_mail_off?(opt)
       return false if opt.nil?
       return false unless opt.respond_to?(:email_level)
-      opt.email_level.to_i >= 2
+
+      el  = opt.email_level.to_i
+      eml = opt.respond_to?(:email_messages_level) ? opt.email_messages_level.to_i : nil
+
+      return el >= 2 if eml.nil?
+      el >= 2 && eml >= 2
     end
 
     def self.user_too_new?(user)
@@ -137,7 +141,6 @@ after_initialize do
       end
 
       event = args[:event].to_s.presence || "digest_set_to_never"
-
       opt = user.user_option
 
       # Must still match the event state at execution time
@@ -204,6 +207,7 @@ after_initialize do
 
   # ============================================================
   # ✅ HOOK 1: Preferences UI save path (logged-in user)
+  #     Runs ONLY when the user clicks Save in Preferences UI.
   # ============================================================
   if defined?(::Users::PreferencesController)
     class ::Users::PreferencesController
@@ -236,26 +240,18 @@ after_initialize do
 
   # ============================================================
   # ✅ HOOK 2: Email unsubscribe flow
+  #
+  # ABSOLUTELY NOTHING runs on unsubscribe PAGE LOAD.
+  # We intentionally DO NOT hook EmailController#unsubscribe (GET page display).
+  #
+  # We only hook perform_unsubscribe (the action that actually saves changes).
   # ============================================================
   class ::EmailController
     module ::UnsubUpdateEmailHook
-      def unsubscribe
-        return super unless ::UnsubUpdateConfig::ENABLED
-        result = super
-
-        begin
-          user = resolve_user_from_unsub_key(params[:key])
-          ::UnsubUpdate.check_and_enqueue_all(user, source: "email_unsubscribe")
-        rescue => e
-          Rails.logger.warn("[unsub-update] EMAIL unsubscribe hook error err=#{e.class}: #{e.message}")
-        end
-
-        result
-      end
-
-      # Some Discourse versions do the actual state change here.
+      # Some Discourse versions do the actual state change here (after user clicks Save).
       def perform_unsubscribe
         return super unless ::UnsubUpdateConfig::ENABLED
+
         result = super
 
         begin
