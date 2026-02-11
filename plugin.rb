@@ -2,13 +2,14 @@
 
 # name: unsub-update
 # about: Postback when a user sets digest to "Never" via prefs/API. UI: ticking unsubscribe_all sets digest dropdown to never.
-# version: 1.1.2
+# version: 1.1.3
 # authors: you
 
 after_initialize do
   require "net/http"
   require "uri"
   require "json"
+  require "erb"
 
   module ::UnsubUpdateConfig
     ENABLED = true
@@ -18,6 +19,9 @@ after_initialize do
     OPEN_TIMEOUT_SECONDS = 5
     READ_TIMEOUT_SECONDS = 5
 
+    # UI: on /email/unsubscribe/:key, when unsubscribe_all is checked:
+    # - set digest dropdown to "never" (0)
+    # - optionally disable the dropdown
     UI_DISABLE_DIGEST_DROPDOWN_WHEN_UNSUB_ALL = true
 
     # Keep safe: do NOT force digest based on email_level changes.
@@ -101,7 +105,7 @@ after_initialize do
         "email" => user.email.to_s,
         "registered_at" => (user.created_at&.utc&.iso8601 || ""),
         "email_level" => (opt&.respond_to?(:email_level) ? opt.email_level.to_i.to_s : ""),
-        "email_digests" => (opt&.email_digests.nil? ? "" : opt.email_digests ? "1" : "0"),
+        "email_digests" => (opt&.email_digests.nil? ? "" : (opt.email_digests ? "1" : "0")),
         "digest_after_minutes" => opt&.digest_after_minutes.to_i.to_s,
         "sent_at_utc" => Time.zone.now.utc.iso8601,
         "secret" => ::UnsubUpdateConfig::SHARED_SECRET
@@ -226,26 +230,34 @@ after_initialize do
     prepend ::UnsubUpdateEmailUnsubscribeHook
   end
 
-  # 3) UI injection — move to HEAD and use robust selectors
+  # 3) UI injection — add CSP nonce so inline script actually runs
   begin
     js_disable_dropdown = ::UnsubUpdateConfig::UI_DISABLE_DIGEST_DROPDOWN_WHEN_UNSUB_ALL ? "true" : "false"
 
-    register_html_builder("server:before-head-close") do |_ctx|
+    register_html_builder("server:before-head-close") do |ctx|
+      # Discourse uses CSP nonces; without nonce the browser will often block inline scripts.
+      nonce =
+        ctx[:content_security_policy_nonce] ||
+        ctx["content_security_policy_nonce"] ||
+        ctx[:csp_nonce] ||
+        ctx["csp_nonce"]
+
+      nonce_attr = nonce.present? ? " nonce=\"#{ERB::Util.html_escape(nonce)}\"" : ""
+
       <<~HTML
-        <script>
+        <script#{nonce_attr}>
         (function(){
           try {
             var DISABLE = #{js_disable_dropdown};
 
             function isUnsubPage(){
               var p = (location && location.pathname) ? location.pathname : "";
-              return p.indexOf("/email/unsubscribe/") === 0;
+              return /\\/email\\/unsubscribe\\//.test(p);
             }
 
             function q(sel){ try { return document.querySelector(sel); } catch(e){ return null; } }
 
             function findCheckbox(){
-              // try common ids and names
               return q("#unsubscribe_all") ||
                      q("input[name='unsubscribe_all']") ||
                      q("input#user_option_unsubscribe_all") ||
@@ -270,6 +282,16 @@ after_initialize do
               return true;
             }
 
+            function apply(cb, dd){
+              if (!cb || !dd) return;
+              if (cb.checked) {
+                setNever(dd);
+                if (DISABLE) dd.disabled = true;
+              } else {
+                if (DISABLE) dd.disabled = false;
+              }
+            }
+
             function bindOnce(){
               if (!isUnsubPage()) return true;
 
@@ -282,17 +304,19 @@ after_initialize do
               // If no checkbox exists on this variant, nothing to do.
               if (!cb) return true;
 
-              if (cb.__unsubUpdateBound) return true;
+              if (cb.__unsubUpdateBound) {
+                apply(cb, dd);
+                return true;
+              }
+
               cb.__unsubUpdateBound = true;
 
               cb.addEventListener("change", function(){
-                if (cb.checked) {
-                  setNever(dd);
-                  if (DISABLE) dd.disabled = true;
-                } else {
-                  if (DISABLE) dd.disabled = false;
-                }
+                apply(cb, dd);
               });
+
+              // Apply immediately on load too (not only on change)
+              apply(cb, dd);
 
               return true;
             }
