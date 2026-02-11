@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 # name: unsub-update
-# about: When a user sets Activity Summary (digest) to "Never" (email_digests=false OR digest_after_minutes<=0) and they registered >10 minutes ago, send an async POST.
-# version: 1.0.2
+# about: Postback when a user sets Activity Summary (digest) to "Never" via prefs/API OR via email unsubscribe flow.
+# version: 1.0.3
 # authors: you
 
 after_initialize do
@@ -19,9 +19,16 @@ after_initialize do
     READ_TIMEOUT_SECONDS = 5
   end
 
-  def self._unsub_never?(user_option)
-    return false if user_option.nil?
-    user_option.email_digests == false || user_option.digest_after_minutes.to_i <= 0
+  module ::UnsubUpdate
+    def self.unsub_never?(user_option)
+      return false if user_option.nil?
+      user_option.email_digests == false || user_option.digest_after_minutes.to_i <= 0
+    end
+
+    def self.user_too_new?(user)
+      min_age = ::UnsubUpdateConfig::MIN_MINUTES_SINCE_REGISTRATION.to_i.minutes
+      user.created_at.present? && (Time.zone.now - user.created_at) < min_age
+    end
   end
 
   class ::Jobs::UnsubUpdatePostback < ::Jobs::Base
@@ -32,10 +39,12 @@ after_initialize do
       return if user.nil? || user.staged? || user.suspended?
 
       opt = user.user_option
-      return unless ::UnsubUpdate._unsub_never?(opt) rescue (opt && (opt.email_digests == false || opt.digest_after_minutes.to_i <= 0))
+      return unless ::UnsubUpdate.unsub_never?(opt)
 
-      min_age = ::UnsubUpdateConfig::MIN_MINUTES_SINCE_REGISTRATION.to_i.minutes
-      return if user.created_at.present? && (Time.zone.now - user.created_at) < min_age
+      if ::UnsubUpdate.user_too_new?(user)
+        Rails.logger.warn("[unsub-update] SKIP (too new) user_id=#{user.id}")
+        return
+      end
 
       payload = {
         "event" => "digest_set_to_never",
@@ -73,34 +82,76 @@ after_initialize do
     end
   end
 
+  # -----------------------------
+  # 1) Trigger on prefs/API changes (normal path)
+  # -----------------------------
   UserOption.class_eval do
     after_commit :_unsub_update_after_commit, on: [:update]
 
     def _unsub_update_after_commit
       return unless ::UnsubUpdateConfig::ENABLED
 
-      # Detect either field changed (because "Never" may flip email_digests, not digest_after_minutes)
       changed =
         (respond_to?(:saved_change_to_email_digests?) && saved_change_to_email_digests?) ||
         (respond_to?(:saved_change_to_digest_after_minutes?) && saved_change_to_digest_after_minutes?) ||
         (previous_changes.key?("email_digests") || previous_changes.key?("digest_after_minutes"))
 
       return unless changed
-
-      # Only trigger when state is "never"
-      return unless (email_digests == false || digest_after_minutes.to_i <= 0)
+      return unless ::UnsubUpdate.unsub_never?(self)
 
       u = self.user
       return if u.nil?
 
-      min_age = ::UnsubUpdateConfig::MIN_MINUTES_SINCE_REGISTRATION.to_i.minutes
-      if u.created_at.present? && (Time.zone.now - u.created_at) < min_age
+      if ::UnsubUpdate.user_too_new?(u)
         Rails.logger.warn("[unsub-update] SKIP (too new) user_id=#{u.id}")
         return
       end
 
-      Rails.logger.warn("[unsub-update] ENQUEUE user_id=#{u.id} email_digests=#{email_digests.inspect} digest_after_minutes=#{digest_after_minutes.inspect}")
+      Rails.logger.warn("[unsub-update] ENQUEUE user_id=#{u.id} email_digests=#{email_digests.inspect} digest_after_minutes=#{digest_after_minutes.inspect} source=user_option_update")
       ::Jobs.enqueue(:unsub_update_postback, user_id: u.id)
     end
+  end
+
+  # -----------------------------
+  # 2) Trigger on email unsubscribe clicks (/email/unsubscribe/:key)
+  #    This catches cases where Discourse bypasses UserOption callbacks.
+  # -----------------------------
+  class ::EmailController
+    module ::UnsubUpdateEmailUnsubscribeHook
+      def unsubscribe
+        super
+
+        return unless ::UnsubUpdateConfig::ENABLED
+
+        # Best-effort: resolve user from key (works even if controller ivars change)
+        user = nil
+        begin
+          if defined?(::UnsubscribeKey)
+            k = ::UnsubscribeKey.includes(:user).find_by(key: params[:key].to_s)
+            user = k&.user
+          end
+        rescue => e
+          Rails.logger.warn("[unsub-update] EMAIL-UNSUB resolve key error err=#{e.class}: #{e.message}")
+        end
+
+        return if user.nil? || user.staged? || user.suspended?
+
+        opt = user.user_option
+        unless ::UnsubUpdate.unsub_never?(opt)
+          Rails.logger.warn("[unsub-update] EMAIL-UNSUB no-op user_id=#{user.id} (digest not set to never)")
+          return
+        end
+
+        if ::UnsubUpdate.user_too_new?(user)
+          Rails.logger.warn("[unsub-update] EMAIL-UNSUB SKIP (too new) user_id=#{user.id}")
+          return
+        end
+
+        Rails.logger.warn("[unsub-update] EMAIL-UNSUB ENQUEUE user_id=#{user.id}")
+        ::Jobs.enqueue(:unsub_update_postback, user_id: user.id)
+      end
+    end
+
+    prepend ::UnsubUpdateEmailUnsubscribeHook
   end
 end
