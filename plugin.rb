@@ -2,7 +2,7 @@
 
 # name: unsub-update
 # about: Postback when a user disables Activity Summary (digest) OR disables ALL email via checkbox, via Preferences UI or email unsubscribe flow.
-# version: 1.2.2
+# version: 1.2.3
 # authors: you
 
 after_initialize do
@@ -17,6 +17,9 @@ after_initialize do
     SHARED_SECRET = ""   # sent as form field "secret"
     OPEN_TIMEOUT_SECONDS = 5
     READ_TIMEOUT_SECONDS = 5
+
+    # ✅ NEW: master switch for forcing digest settings off when reporting events
+    FORCE_DISABLE_DIGESTS_BEFORE_REPORTING = true
 
     # Fire-once guard (per user per event) so you don’t spam endpoint
     # Set to false for testing to allow repeated postbacks.
@@ -54,9 +57,10 @@ after_initialize do
       user.created_at.present? && (Time.zone.now - user.created_at) < min_age
     end
 
-    # ✅ NEW: Always force digests off before we report ANY event
-    # Guarantees: user.user_option.email_digests == false (and digest_after_minutes == 0) after this runs.
+    # ✅ Force digests off (optional via config switch)
     def self.ensure_digests_disabled!(user, source:)
+      return unless ::UnsubUpdateConfig::FORCE_DISABLE_DIGESTS_BEFORE_REPORTING
+
       return if user.nil?
       return if user.staged? || user.suspended?
 
@@ -70,11 +74,9 @@ after_initialize do
       return unless needs_change
 
       begin
-        # Prefer a normal update (touches updated_at etc.)
         opt.update!(email_digests: false, digest_after_minutes: 0)
         Rails.logger.warn("[unsub-update] FORCED digests off user_id=#{user.id} source=#{source}")
       rescue => e
-        # Fallback: fail-safe, still enforce the state
         begin
           opt.update_columns(email_digests: false, digest_after_minutes: 0)
           Rails.logger.warn("[unsub-update] FORCED digests off (update_columns) user_id=#{user.id} source=#{source} err=#{e.class}: #{e.message}")
@@ -135,7 +137,7 @@ after_initialize do
 
       return unless should_fire
 
-      # ✅ NEW: Regardless of which event we’re about to report, force digest emails off.
+      # ✅ Optional forcing (controlled by config)
       ensure_digests_disabled!(user, source: "maybe_enqueue_event:#{source}")
 
       if ::UnsubUpdateConfig::ENABLE_FIRE_ONCE_GUARD && already_sent?(event, user.id)
@@ -143,7 +145,7 @@ after_initialize do
         return
       end
 
-      Rails.logger.warn("[unsub-update] ENQUEUE user_id=#{user.id} event=#{event} source=#{source} guard=#{::UnsubUpdateConfig::ENABLE_FIRE_ONCE_GUARD ? "on" : "off"}")
+      Rails.logger.warn("[unsub-update] ENQUEUE user_id=#{user.id} event=#{event} source=#{source} guard=#{::UnsubUpdateConfig::ENABLE_FIRE_ONCE_GUARD ? "on" : "off"} force_digest_off=#{::UnsubUpdateConfig::FORCE_DISABLE_DIGESTS_BEFORE_REPORTING ? "on" : "off"}")
       ::Jobs.enqueue(:unsub_update_postback, user_id: user.id, event: event.to_s, source: source.to_s)
     rescue => e
       Rails.logger.warn("[unsub-update] maybe_enqueue_event error user_id=#{user&.id} event=#{event} source=#{source} err=#{e.class}: #{e.message}")
@@ -154,7 +156,7 @@ after_initialize do
       return if user.nil?
       user.reload
 
-      # ✅ NEW: If we’re going to report anything at all, we also enforce digests off right here.
+      # ✅ Optional forcing (controlled by config)
       ensure_digests_disabled!(user, source: "check_and_enqueue_all:#{source}")
       user.reload
 
@@ -179,7 +181,7 @@ after_initialize do
 
       event = args[:event].to_s.presence || "digest_set_to_never"
 
-      # ✅ NEW: Before reporting ANY event, force digests off.
+      # ✅ Optional forcing (controlled by config)
       ::UnsubUpdate.ensure_digests_disabled!(user, source: "job_execute:#{args[:source].to_s.presence || "unknown"}")
       user.reload
 
@@ -213,8 +215,8 @@ after_initialize do
         "secret" => ::UnsubUpdateConfig::SHARED_SECRET,
         "source" => args[:source].to_s,
         "guard" => (::UnsubUpdateConfig::ENABLE_FIRE_ONCE_GUARD ? "on" : "off"),
+        "force_digest_off" => (::UnsubUpdateConfig::FORCE_DISABLE_DIGESTS_BEFORE_REPORTING ? "on" : "off"),
 
-        # extra diagnostics (harmless for your PHP side; ignore if you want)
         "email_level" => (opt.respond_to?(:email_level) ? opt.email_level.to_i.to_s : ""),
         "email_messages_level" => (opt.respond_to?(:email_messages_level) ? opt.email_messages_level.to_i.to_s : ""),
         "email_digests" => (opt&.email_digests.nil? ? "" : opt.email_digests ? "1" : "0"),
@@ -249,7 +251,6 @@ after_initialize do
 
   # ============================================================
   # ✅ HOOK 1: Preferences UI save path (logged-in user)
-  #     Runs ONLY when the user clicks Save in Preferences UI.
   # ============================================================
   if defined?(::Users::PreferencesController)
     class ::Users::PreferencesController
@@ -257,7 +258,6 @@ after_initialize do
         def update
           return super unless ::UnsubUpdateConfig::ENABLED
 
-          # Run Discourse behavior first (we do not alter it)
           result = super
 
           begin
@@ -281,16 +281,10 @@ after_initialize do
   end
 
   # ============================================================
-  # ✅ HOOK 2: Email unsubscribe flow
-  #
-  # ABSOLUTELY NOTHING runs on unsubscribe PAGE LOAD.
-  # We intentionally DO NOT hook EmailController#unsubscribe (GET page display).
-  #
-  # We only hook perform_unsubscribe (the action that actually saves changes).
+  # ✅ HOOK 2: Email unsubscribe flow (perform_unsubscribe only)
   # ============================================================
   class ::EmailController
     module ::UnsubUpdateEmailHook
-      # Some Discourse versions do the actual state change here (after user clicks Save).
       def perform_unsubscribe
         return super unless ::UnsubUpdateConfig::ENABLED
 
