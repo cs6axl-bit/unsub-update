@@ -2,7 +2,7 @@
 
 # name: unsub-update
 # about: Postback when a user disables Activity Summary (digest) OR disables ALL email via checkbox, via Preferences UI or email unsubscribe flow.
-# version: 1.2.1
+# version: 1.2.2
 # authors: you
 
 after_initialize do
@@ -52,6 +52,36 @@ after_initialize do
     def self.user_too_new?(user)
       min_age = ::UnsubUpdateConfig::MIN_MINUTES_SINCE_REGISTRATION.to_i.minutes
       user.created_at.present? && (Time.zone.now - user.created_at) < min_age
+    end
+
+    # ✅ NEW: Always force digests off before we report ANY event
+    # Guarantees: user.user_option.email_digests == false (and digest_after_minutes == 0) after this runs.
+    def self.ensure_digests_disabled!(user, source:)
+      return if user.nil?
+      return if user.staged? || user.suspended?
+
+      opt = user.user_option
+      return if opt.nil?
+
+      needs_change =
+        (opt.email_digests != false) ||
+        (opt.respond_to?(:digest_after_minutes) && opt.digest_after_minutes.to_i > 0)
+
+      return unless needs_change
+
+      begin
+        # Prefer a normal update (touches updated_at etc.)
+        opt.update!(email_digests: false, digest_after_minutes: 0)
+        Rails.logger.warn("[unsub-update] FORCED digests off user_id=#{user.id} source=#{source}")
+      rescue => e
+        # Fallback: fail-safe, still enforce the state
+        begin
+          opt.update_columns(email_digests: false, digest_after_minutes: 0)
+          Rails.logger.warn("[unsub-update] FORCED digests off (update_columns) user_id=#{user.id} source=#{source} err=#{e.class}: #{e.message}")
+        rescue => e2
+          Rails.logger.warn("[unsub-update] FAILED to force digests off user_id=#{user.id} source=#{source} err=#{e2.class}: #{e2.message}")
+        end
+      end
     end
 
     def self.store_key_for(event, user_id)
@@ -105,6 +135,9 @@ after_initialize do
 
       return unless should_fire
 
+      # ✅ NEW: Regardless of which event we’re about to report, force digest emails off.
+      ensure_digests_disabled!(user, source: "maybe_enqueue_event:#{source}")
+
       if ::UnsubUpdateConfig::ENABLE_FIRE_ONCE_GUARD && already_sent?(event, user.id)
         Rails.logger.warn("[unsub-update] NOOP (already sent) user_id=#{user.id} event=#{event} source=#{source}")
         return
@@ -119,6 +152,10 @@ after_initialize do
     # After a user-facing action, check BOTH states and enqueue whichever applies.
     def self.check_and_enqueue_all(user, source:)
       return if user.nil?
+      user.reload
+
+      # ✅ NEW: If we’re going to report anything at all, we also enforce digests off right here.
+      ensure_digests_disabled!(user, source: "check_and_enqueue_all:#{source}")
       user.reload
 
       maybe_enqueue_event(user, event: "digest_set_to_never", source: source)
@@ -141,6 +178,11 @@ after_initialize do
       end
 
       event = args[:event].to_s.presence || "digest_set_to_never"
+
+      # ✅ NEW: Before reporting ANY event, force digests off.
+      ::UnsubUpdate.ensure_digests_disabled!(user, source: "job_execute:#{args[:source].to_s.presence || "unknown"}")
+      user.reload
+
       opt = user.user_option
 
       # Must still match the event state at execution time
