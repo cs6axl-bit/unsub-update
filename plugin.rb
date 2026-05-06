@@ -2,7 +2,7 @@
 
 # name: unsub-update
 # about: Postback when a user disables Activity Summary (digest) OR disables ALL email via checkbox, via Preferences UI or email unsubscribe flow.
-# version: 1.2.3
+# version: 1.3.0
 # authors: you
 
 after_initialize do
@@ -114,7 +114,7 @@ after_initialize do
     end
 
     # Central gate: enqueue if state matches AND (optionally) not sent before.
-    def self.maybe_enqueue_event(user, event:, source:)
+    def self.maybe_enqueue_event(user, event:, source:, email_id: "")
       return unless ::UnsubUpdateConfig::ENABLED
       return if user.nil? || user.staged? || user.suspended?
 
@@ -146,13 +146,13 @@ after_initialize do
       end
 
       Rails.logger.warn("[unsub-update] ENQUEUE user_id=#{user.id} event=#{event} source=#{source} guard=#{::UnsubUpdateConfig::ENABLE_FIRE_ONCE_GUARD ? "on" : "off"} force_digest_off=#{::UnsubUpdateConfig::FORCE_DISABLE_DIGESTS_BEFORE_REPORTING ? "on" : "off"}")
-      ::Jobs.enqueue(:unsub_update_postback, user_id: user.id, event: event.to_s, source: source.to_s)
+      ::Jobs.enqueue(:unsub_update_postback, user_id: user.id, event: event.to_s, source: source.to_s, email_id: email_id.to_s)
     rescue => e
       Rails.logger.warn("[unsub-update] maybe_enqueue_event error user_id=#{user&.id} event=#{event} source=#{source} err=#{e.class}: #{e.message}")
     end
 
     # After a user-facing action, check BOTH states and enqueue whichever applies.
-    def self.check_and_enqueue_all(user, source:)
+    def self.check_and_enqueue_all(user, source:, email_id: "")
       return if user.nil?
       user.reload
 
@@ -160,8 +160,8 @@ after_initialize do
       ensure_digests_disabled!(user, source: "check_and_enqueue_all:#{source}")
       user.reload
 
-      maybe_enqueue_event(user, event: "digest_set_to_never", source: source)
-      maybe_enqueue_event(user, event: "all_email_disabled",  source: source)
+      maybe_enqueue_event(user, event: "digest_set_to_never", source: source, email_id: email_id)
+      maybe_enqueue_event(user, event: "all_email_disabled",  source: source, email_id: email_id)
     rescue => e
       Rails.logger.warn("[unsub-update] check_and_enqueue_all error user_id=#{user&.id} source=#{source} err=#{e.class}: #{e.message}")
     end
@@ -220,7 +220,9 @@ after_initialize do
         "email_level" => (opt.respond_to?(:email_level) ? opt.email_level.to_i.to_s : ""),
         "email_messages_level" => (opt.respond_to?(:email_messages_level) ? opt.email_messages_level.to_i.to_s : ""),
         "email_digests" => (opt&.email_digests.nil? ? "" : opt.email_digests ? "1" : "0"),
-        "digest_after_minutes" => opt&.digest_after_minutes.to_i.to_s
+        "digest_after_minutes" => opt&.digest_after_minutes.to_i.to_s,
+
+        "email_id" => args[:email_id].to_s.strip
       }
 
       uri = URI(::UnsubUpdateConfig::ENDPOINT_URL)
@@ -288,11 +290,12 @@ after_initialize do
       def perform_unsubscribe
         return super unless ::UnsubUpdateConfig::ENABLED
 
+        email_id = params[:email_id].to_s.strip rescue ""
         result = super
 
         begin
           user = resolve_user_from_unsub_key(params[:key])
-          ::UnsubUpdate.check_and_enqueue_all(user, source: "email_perform_unsubscribe")
+          ::UnsubUpdate.check_and_enqueue_all(user, source: "email_perform_unsubscribe", email_id: email_id)
         rescue => e
           Rails.logger.warn("[unsub-update] EMAIL perform_unsubscribe hook error err=#{e.class}: #{e.message}")
         end
