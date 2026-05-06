@@ -8,6 +8,7 @@
 after_initialize do
   require "net/http"
   require "uri"
+  require "cgi"
   require "json"
 
   module ::UnsubUpdateConfig
@@ -290,7 +291,20 @@ after_initialize do
       def perform_unsubscribe
         return super unless ::UnsubUpdateConfig::ENABLED
 
+        # email_id is on the GET (page load) URL, not the POST body.
+        # Read it from the Referer header which the browser sends on form submit.
         email_id = params[:email_id].to_s.strip rescue ""
+        if email_id.empty?
+          begin
+            ref = request.referer.to_s
+            if ref.include?("email_id=")
+              uri = URI.parse(ref)
+              email_id = CGI.parse(uri.query.to_s)["email_id"]&.first.to_s.strip
+            end
+          rescue StandardError
+          end
+        end
+
         result = super
 
         begin
